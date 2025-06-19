@@ -324,7 +324,7 @@ class ACT(nn.Module):
             # dimension.
             num_input_token_encoder = 1 + config.chunk_size
             if self.config.robot_state_feature:
-                num_input_token_encoder += 1
+                num_input_token_encoder += 1 
             self.register_buffer(
                 "vae_encoder_pos_enc",
                 create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
@@ -423,7 +423,7 @@ class ACT(nn.Module):
             )  # (B, 1, D)
             if self.config.robot_state_feature:
                 robot_state_embed = self.vae_encoder_robot_state_input_proj(batch["observation.state"])
-                robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
+                robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D) already (B, S, D) if using delta_timestamps
             action_embed = self.vae_encoder_action_input_proj(batch["action"])  # (B, S, D)
 
             if self.config.robot_state_feature:
@@ -435,6 +435,7 @@ class ACT(nn.Module):
             # Prepare fixed positional embedding.
             # Note: detach() shouldn't be necessary but leaving it the same as the original code just in case.
             pos_embed = self.vae_encoder_pos_enc.clone().detach()  # (1, S+2, D)
+
 
             # Prepare key padding mask for the transformer encoder. We have 1 or 2 extra tokens at the start of the
             # sequence depending whether we use the input states or not (cls and robot state)
@@ -472,6 +473,7 @@ class ACT(nn.Module):
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+
         # Robot state token.
         if self.config.robot_state_feature:
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
@@ -480,7 +482,6 @@ class ACT(nn.Module):
             encoder_in_tokens.append(
                 self.encoder_env_state_input_proj(batch["observation.environment_state"])
             )
-
         # Camera observation features and positional embeddings.
         if self.config.image_features:
             all_cam_features = []

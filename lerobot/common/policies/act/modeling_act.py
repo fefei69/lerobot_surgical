@@ -37,6 +37,7 @@ from lerobot.common.policies.act.configuration_act import ACTConfig
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 
+from transformers import AutoBackbone
 
 class ACTPolicy(PreTrainedPolicy):
     """
@@ -342,6 +343,15 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
+            # dinov2_ckpt = "facebook/dinov2-with-registers-base"          # ViT-B/16, 768-dim
+            # Load the backbone model
+            # backbone_model = AutoBackbone.from_pretrained(       # returns feature maps already
+            #     dinov2_ckpt,
+            #     out_indices=(12,),        # last transformer block
+            #     reshape_hidden_states=True  # gives B,C,H,W instead of sequence
+            # )
+            # self.backbone = backbone_model
+
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
@@ -358,8 +368,12 @@ class ACT(nn.Module):
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
+            if hasattr(backbone_model, "fc"):          # ResNet path
+                in_feats = backbone_model.fc.in_features
+            else:                                      # DINO-v2 / ViT path
+                in_feats = backbone_model.config.hidden_size   # e.g. 768
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                in_feats, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -490,6 +504,7 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             for img in batch["observation.images"]:
                 cam_features = self.backbone(img)["feature_map"]
+                # cam_features = self.backbone(img).feature_maps[0]  # B,768,34,35
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 

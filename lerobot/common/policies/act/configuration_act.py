@@ -105,9 +105,11 @@ class ACTConfig(PreTrainedConfig):
 
     # Architecture.
     # Vision backbone.
-    vision_backbone: str = "resnet18"
+    vision_backbone: str = "resnet18" # facebook/dinov2-with-registers-base, microsoft/swinv2-tiny-patch4-window8-256
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # The output indices of the vision backbone from AutoBackbone to use.
+    vision_backbone_out_indices: tuple[int, ...] = (12,)  # (12,) for dinov2, (4,) for Swin Transformer V2
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -141,10 +143,11 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
-            raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
-            )
+        # NOTE: disable this because we are using a custom vision backbone.
+        # if not self.vision_backbone.startswith("resnet"):
+        #     raise ValueError(
+        #         f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+        #     )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "

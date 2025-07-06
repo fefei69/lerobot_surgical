@@ -188,6 +188,34 @@ class JsonDataset:
                 images[image_key].append(image_rgb)
 
         return images
+    
+    def _process_retraction_episode(
+            self,
+            episode_data: Dict,
+            part_key: str = "psm_retraction_js",
+        ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return (state, action) for the retraction arm only.
+
+        • state  : shape (T, 7)  [qpos(6), gripper(1)]
+        • action : shape (T, 7)  Δ-state; last frame is 0-vector
+        """
+        # ----– collect joint + gripper per frame –--------------------------------
+        states = []
+        for sample in episode_data["data"]:
+            js    = sample["states"][part_key]
+            qpos  = js["qpos"]                 # 6-dim list
+            grip  = js["gripper"]              # scalar
+            states.append(qpos + [grip])       # 7-dim
+
+        states = np.asarray(states, dtype=np.float32)      # (T, 7)
+
+        # ----– first-order finite difference → action –---------------------------
+        actions            = np.zeros_like(states)         # (T, 7)
+        actions[:-1]       = states[1:] - states[:-1]      # Δq_t
+        # actions[-1] is already zero
+
+        return states, actions
 
 
     def get_item(self, index: Optional[int] = None,) -> Dict:
@@ -196,13 +224,14 @@ class JsonDataset:
         file_path = np.random.choice(self.episode_paths) if index is None else self.episode_paths[index]
         episode_data = self.episodes_data_cached[index]
 
-        # Load state and action data
-        state = self._extract_data(episode_data, 'states', self.json_state_data_name)
+        # Load state and action data (retraction only)
+        state, action = self._process_retraction_episode(episode_data)
+        # state = self._extract_data(episode_data, 'states', self.json_state_data_name)
         # action = self._extract_data(episode_data, 'actions', self.json_action_data_name)
         episode_length = len(state)
         state_dim = state.shape[1] if len(state.shape) == 2 else state.shape[0]
         # Fake action for now, as we don't have actions in the JSON dataset
-        action = np.zeros((episode_length, state.shape[1]), dtype=np.float32)  # Fake action data
+        # action = np.zeros((episode_length, state.shape[1]), dtype=np.float32)  # Fake action data
         action_dim = action.shape[1] if len(action.shape) == 2 else state.shape[0]
         
         # Load task descriptionJ
@@ -246,14 +275,14 @@ def create_empty_dataset(
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (len(motors),),
+            "shape": (7,), # 6 joints + 1 gripper
             "names": [
                 motors,
             ],
         },
         "action": {
             "dtype": "float32",
-            "shape": (len(motors),),
+            "shape": (7,), # 6 joints + 1 gripper (relative joint values)
             "names": [
                 motors,
             ],

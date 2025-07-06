@@ -333,24 +333,23 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
-
-            # dinov2_ckpt = "facebook/dinov2-with-registers-base"          # ViT-B/16, 768-dim
-            # Load the backbone model
-            # backbone_model = AutoBackbone.from_pretrained(       # returns feature maps already
-            #     dinov2_ckpt,
-            #     out_indices=(12,),        # last transformer block
-            #     reshape_hidden_states=True  # gives B,C,H,W instead of sequence
-            # )
-            # self.backbone = backbone_model
+            if config.vision_backbone == "resnet18":
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+                # feature map).
+                # Note: The forward method of this returns a dict: {"feature_map": output}.
+                self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            else:
+                # Load the backbone model
+                backbone_model = AutoBackbone.from_pretrained(                 # returns feature maps already
+                    config.vision_backbone,
+                    out_indices=config.vision_backbone_out_indices,            # last transformer block
+                )
+                self.backbone = backbone_model
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -503,8 +502,12 @@ class ACT(nn.Module):
 
             # For a list of images, the H and W may vary but H*W is constant.
             for img in batch["observation.images"]:
-                cam_features = self.backbone(img)["feature_map"]
-                # cam_features = self.backbone(img).feature_maps[0]  # B,768,34,35
+                if self.config.vision_backbone == "resnet18":
+                    # Usage of torchvision
+                    cam_features = self.backbone(img)["feature_map"] 
+                else:
+                    # Usage of AutoBackbone from transformers
+                    cam_features = self.backbone(img).feature_maps[0]  # B,768,34,35
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 

@@ -148,13 +148,13 @@ def rollout(
     while not np.all(done):
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
+        observation['observation.state'] 
         if return_observations:
             all_observations.append(deepcopy(observation))
 
         observation = {
             key: observation[key].to(device, non_blocking=device.type == "cuda") for key in observation
         }
-
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
         observation = add_envs_task(env, observation)

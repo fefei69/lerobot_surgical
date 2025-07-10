@@ -349,7 +349,9 @@ class ACT(nn.Module):
                     config.vision_backbone,
                     out_indices=config.vision_backbone_out_indices,            # last transformer block
                 )
-                self.backbone = backbone_model
+                # freeze the backbone's weights
+                backbone_model.requires_grad_(False)
+                self.backbone = backbone_model 
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)

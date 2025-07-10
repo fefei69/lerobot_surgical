@@ -40,18 +40,13 @@ class RobotConfig:
 
 dVRK_CONFIG = RobotConfig(
     motors=[
-        "psm1_yaw_joint",
-        "psm1_pitch_end_joint",
-        "psm1_main_insertion_joint",
-        "psm1_tool_roll_joint",
-        "psm1_tool_pitch_joint",
-        "psm1_tool_yaw_joint",
-        "psm2_yaw_joint",
-        "psm2_pitch_end_joint",
-        "psm2_main_insertion_joint",
-        "psm2_tool_roll_joint",
-        "psm2_tool_pitch_joint",
-        "psm2_tool_yaw_joint",
+        "psm_yaw_joint",
+        "psm_pitch_end_joint",
+        "psm_main_insertion_joint",
+        "psm_tool_roll_joint",
+        "psm_tool_pitch_joint",
+        "psm_tool_yaw_joint",
+        "psm_tool_gripper_joint",
         
     ],
     cameras=[
@@ -339,7 +334,7 @@ def populate_dataset(
     raw_dir: Path,
     robot_type: str,
 ) -> LeRobotDataset:
-
+    
     json_dataset = JsonDataset(raw_dir, robot_type)
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)

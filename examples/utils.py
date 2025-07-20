@@ -1,32 +1,14 @@
-"""
-Script Json to Lerobot.
-
-# --raw-dir     Corresponds to the directory of your JSON dataset
-# --repo-id     Your unique repo ID on Hugging Face Hub
-# --robot_type  The type of the robot used in the dataset (e.g., Unitree_G1_Dex3, Unitree_Z1_Dual, Unitree_G1_Dex3)
-# --push_to_hub Whether or not to upload the dataset to Hugging Face Hub (true or false)
-
-python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
-    --raw-dir $HOME/datasets/g1_grabcube_double_hand \
-    --repo-id your_name/g1_grabcube_double_hand \
-    --robot_type Unitree_G1_Dex3 \ 
-    --push_to_hub
-"""
 import os
 import cv2
+import numpy as np
 import tqdm
-import tyro
 import json
 import glob
 import dataclasses
 import shutil
-import numpy as np
 from pathlib import Path
 from collections import defaultdict
 from typing import Literal, List, Dict, Optional
-
-from lerobot.common.constants import HF_LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 
 # migrate from unitree_lerobot.utils.constants import ROBOT_CONFIGS
@@ -62,18 +44,6 @@ ROBOT_CONFIGS = {
     "DVRK": dVRK_CONFIG,
 }
 
-@dataclasses.dataclass(frozen=True)
-class DatasetConfig:
-    use_videos: bool = True
-    tolerance_s: float = 0.0001
-    image_writer_processes: int = 10
-    image_writer_threads: int = 5
-    video_backend: str | None = None
-
-
-DEFAULT_DATASET_CONFIG = DatasetConfig()
-
-
 class JsonDataset:
     def __init__(self, data_dirs: Path, robot_type: str) -> None:
         """
@@ -85,6 +55,7 @@ class JsonDataset:
         assert data_dirs is not None, "Data directory cannot be None"
         assert robot_type is not None, "Robot type cannot be None"
         self.data_dirs = data_dirs
+        
         self.json_file = 'data.json'
         
         # Initialize paths and cache
@@ -184,63 +155,38 @@ class JsonDataset:
 
         return images
     
-    # def _process_retraction_episode(
-    #         self,
-    #         episode_data: Dict,
-    #         part_key: str = "psm_retraction_js",
-    #     ) -> tuple[np.ndarray, np.ndarray]:
-    #     """
-    #     Return (state, action) for the retraction arm only.
-
-    #     • state  : shape (T, 7)  [qpos(6), gripper(1)]
-    #     • action : shape (T, 7)  Δ-state; last frame is 0-vector
-    #     """
-    #     # ----– collect joint + gripper per frame –--------------------------------
-    #     states = []
-    #     for sample in episode_data["data"]:
-    #         js    = sample["states"][part_key]
-    #         qpos  = js["qpos"]                 # 6-dim list
-    #         grip  = js["gripper"]              # scalar
-    #         states.append(qpos + [grip])       # 7-dim
-
-    #     states = np.asarray(states, dtype=np.float32)      # (T, 7)
-
-    #     # ----– first-order finite difference → action –---------------------------
-    #     actions            = np.zeros_like(states)         # (T, 7)
-        # actions[:-1]       = states[1:] - states[:-1]      # Δq_t
-    #     # actions[-1] is already zero
-
-    #     return states, actions
-    
     def _process_retraction_episode(
-        self,
-        episode_data: Dict,
-        part_key: str = "psm_retraction_js",
-    ) -> tuple[np.ndarray, np.ndarray]:
+            self,
+            episode_data: Dict,
+            part_key: str = "psm_retraction_js",
+        ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Returns (states, actions) for one episode.
+        Return (state, action) for the retraction arm only.
 
-        states  : (T, 7)  -> current [qpos(6) | gripper]
-        actions : (T-1,7) -> *target* joint pos at t+1 (absolute), last sample dropped
+        • state  : shape (T, 7)  [qpos(6), gripper(1)]
+        • action : shape (T, 7)  Δ-state; last frame is 0-vector
         """
-        # ---------- Collect joint + gripper per frame ----------
-        qtraj = []
+        # ----– collect joint + gripper per frame –--------------------------------
+        states = []
+        ee_frames = []
         for sample in episode_data["data"]:
-            js   = sample["states"][part_key]
-            qpos = js["qpos"]          # 6-D list
-            grip = js["gripper"]       # scalar
-            qtraj.append(qpos + [grip])
+            js    = sample["states"][part_key]
+            qpos  = js["qpos"]                 # 6-dim list
+            grip  = js["gripper"]              # scalar
+            states.append(qpos + [grip])       # 7-dim
+            ee_frame_pos: list[float] = sample["states"]["psm_retraction_ee"]["psm_retraction_pos"]
+            ee_frame_quat: list[float] = sample["states"]["psm_retraction_ee"]["psm_retraction_quat"]
+            ee_frames.append(ee_frame_pos + ee_frame_quat)  # 3 + 4 = 7-dim
 
-        states = np.asarray(qtraj, dtype=np.float32)           # (T,7)
+        states = np.asarray(states, dtype=np.float32)      # (T, 7)
+        ee_frames = np.asarray(ee_frames, dtype=np.float32)  # (T, 7)
 
-        # ---------- Create one-step-ahead targets --------------
-        # Drop the final frame because it has no “next” pose.
-        actions = states[1:].copy()                            # (T-1,7)
+        # ----– first-order finite difference → action –---------------------------
+        actions            = np.zeros_like(states)         # (T, 7)
+        actions[:-1]       = states[1:] - states[:-1]      # Δq_t
+        # actions[-1] is already zero
 
-        # Return sequences of equal length (optional):
-        # states[:-1], actions
-        return states[:-1], actions
-
+        return states, actions, ee_frames
 
 
     def get_item(self, index: Optional[int] = None,) -> Dict:
@@ -250,16 +196,14 @@ class JsonDataset:
         episode_data = self.episodes_data_cached[index]
 
         # Load state and action data (retraction only)
-        state, action = self._process_retraction_episode(episode_data)
+        state, action, ee_frames = self._process_retraction_episode(episode_data)
         # state = self._extract_data(episode_data, 'states', self.json_state_data_name)
         # action = self._extract_data(episode_data, 'actions', self.json_action_data_name)
         episode_length = len(state)
         state_dim = state.shape[1] if len(state.shape) == 2 else state.shape[0]
-        # Fake action for now, as we don't have actions in the JSON dataset
-        # action = np.zeros((episode_length, state.shape[1]), dtype=np.float32)  # Fake action data
         action_dim = action.shape[1] if len(action.shape) == 2 else state.shape[0]
-        
-        # Load task descriptionJ
+
+        # Load task description
         task = episode_data.get('text', {}).get('goal', "")
         
         # Load camera images
@@ -275,98 +219,20 @@ class JsonDataset:
             'action_dim': action_dim,
         }
         
+        # TODO: Add an if statement to handle different action types (future states or tool-centric actions)
         return {'episode_index': index,
                 'episode_length': episode_length,
                 'state': state, 
                 'action': action,
+                'ee_frames': ee_frames,
                 'cameras': cameras,
                 'task': task,
                 'data_cfg':data_cfg}
-
-
-def create_empty_dataset(
-    repo_id: str,
-    robot_type: str,
-    mode: Literal["video", "image"] = "video",
-    *,
-    has_velocity: bool = False,
-    has_effort: bool = False,
-    dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
-    FPS: int = 30,
-) -> LeRobotDataset:
     
-    motors = ROBOT_CONFIGS[robot_type].motors
-    cameras = ROBOT_CONFIGS[robot_type].cameras
 
-    features = {
-        "observation.state": {
-            "dtype": "float32",
-            "shape": (7,), # 6 joints + 1 gripper
-            "names": [
-                motors,
-            ],
-        },
-        "action": {
-            "dtype": "float32",
-            "shape": (7,), # 6 joints + 1 gripper (relative joint values)
-            "names": [
-                motors,
-            ],
-        },
-    }
+def main():
+    json_dataset = JsonDataset('dataset/', 'DVRK')
 
-    if has_velocity:
-        features["observation.velocity"] = {
-            "dtype": "float32",
-            "shape": (len(motors),),
-            "names": [
-                motors,
-            ],
-        }
-
-    if has_effort:
-        features["observation.effort"] = {
-            "dtype": "float32",
-            "shape": (len(motors),),
-            "names": [
-                motors,
-            ],
-        }
-
-    for cam in cameras:
-        features[f"observation.images.{cam}"] = {
-            "dtype": mode,
-            "shape": (3, 480, 640),
-            "names": [
-                "channels",
-                "height",
-                "width",
-            ],
-        }
-
-    if Path(HF_LEROBOT_HOME / repo_id).exists():
-        shutil.rmtree(HF_LEROBOT_HOME / repo_id)
-
-    return LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=FPS,
-        robot_type=robot_type,
-        features=features,
-        use_videos=dataset_config.use_videos,
-        tolerance_s=dataset_config.tolerance_s,
-        image_writer_processes=dataset_config.image_writer_processes,
-        image_writer_threads=dataset_config.image_writer_threads,
-        video_backend=dataset_config.video_backend,
-    )
-
-
-def populate_dataset(
-    dataset: LeRobotDataset,
-    raw_dir: Path,
-    robot_type: str,
-) -> LeRobotDataset:
-    
-    json_dataset = JsonDataset(raw_dir, robot_type)
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
 
@@ -383,56 +249,10 @@ def populate_dataset(
                 "action": action[i],
                 "task": task
             }
+            import pdb; pdb.set_trace()  # Debugging breakpoint
 
-            for camera, img_array in cameras.items():
-                frame[f"observation.images.{camera}"] = img_array[i]
-
-            dataset.add_frame(frame)
-
-        dataset.save_episode()
-
-    return dataset
-
-
-def json_to_lerobot(
-    raw_dir: Path,
-    repo_id: str,
-    robot_type: str,        # Unitree_Z1_Dual, Unitree_G1_Gripper, Unitree_G1_Dex3
-    *,
-    push_to_hub: bool = False,
-    mode: Literal["video", "image"] = "video",
-    dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
-):
-
-    if (HF_LEROBOT_HOME / repo_id).exists():
-        shutil.rmtree(HF_LEROBOT_HOME / repo_id)
-
-    dataset = create_empty_dataset(
-        repo_id,
-        robot_type=robot_type,
-        mode=mode,
-        has_effort=False,
-        has_velocity=False,
-        dataset_config=dataset_config,
-        FPS=15,  # Assuming a default FPS of 30
-    )
-    dataset = populate_dataset(
-        dataset,
-        raw_dir,
-        robot_type=robot_type,
-    )
-
-    if push_to_hub:
-        dataset.push_to_hub(upload_large_folder = True)
-
-
-def local_push_to_hub(
-        repo_id: str,
-        root_path: Path,):
-
-    dataset = LeRobotDataset(repo_id = repo_id, root = root_path)
-    dataset.push_to_hub(upload_large_folder = True)
-
+            # for camera, img_array in cameras.items():
+            #     frame[f"observation.images.{camera}"] = img_array[i]
 
 if __name__ == "__main__":
-    tyro.cli(json_to_lerobot)
+    main()

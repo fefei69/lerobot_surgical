@@ -27,7 +27,7 @@ from pathlib import Path
 import gym_pusht  # noqa: F401
 import gymnasium as gym
 import imageio
-import numpy
+import numpy as np
 import torch
 
 # from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
@@ -37,6 +37,8 @@ from glob import glob
 from PIL import Image
 import torch
 from torchvision.transforms import ToTensor
+import tqdm
+from utils import JsonDataset
 
 def load_episode_images(episode_dir: str | Path,
                         view_prefix: str = "left_image"):
@@ -75,14 +77,13 @@ def load_episode_images(episode_dir: str | Path,
 device = "cuda"
 
 # Provide the [hugging face repo id](https://huggingface.co/lerobot/diffusion_pusht):
-pretrained_policy_path = "outputs/train/act_phantom_retraction/checkpoints/060000/pretrained_model"
+pretrained_policy_path = "outputs/train/act_phantom_retraction/checkpoints/040000/pretrained_model"
 # OR a path to a local outputs/train folder.
 # pretrained_policy_path = Path("outputs/train/example_pusht_diffusion")
 
 policy = ACTPolicy.from_pretrained(pretrained_policy_path, local_files_only=True)
 
-left_imgs, _ = load_episode_images("dataset/phantom_retraction/episode_0000/colors", "left_image")
-right_imgs, _ = load_episode_images("dataset/phantom_retraction/episode_0000/colors", "right_image")
+json_dataset = JsonDataset('dataset/phantom_retraction', 'DVRK')
 
 
 # We can verify that the shapes of the features expected by the policy match the ones from the observations
@@ -99,18 +100,45 @@ policy.reset()
 
 
 step = 0
-done = False
-while not done:
+# Random episode index to evaluate
+id = np.random.randint(0, len(json_dataset))
+# for i in tqdm.tqdm(range(len(json_dataset))):
+#     episode = json_dataset.get_item(i)
+
+episode = json_dataset.get_item(id)
+all_state = episode["state"]
+all_action = episode["action"]
+all_cameras = episode["cameras"]
+all_task = episode["task"]
+episode_length = episode["episode_length"]
+
+num_frames = episode_length
+accumulated_error = 0.0
+for i in range(num_frames):
+    frame = {
+        "observation.state": all_state[i],
+        "action": all_action[i],
+        "task": all_task
+    }
+    for camera, img_array in all_cameras.items():
+        frame[f"observation.images.{camera}"] = img_array[i]
+
     # Prepare observation for the policy running in Pytorch
-    state = torch.randn(7)  # Random state for the example
-    left_img = left_imgs[step % len(left_imgs)]  # Get the left image
-    right_img = right_imgs[step % len(right_imgs)]  # Get the right image
+    # Convert the state and images to tensors
+    frame["observation.state"] = torch.tensor(frame["observation.state"], dtype=torch.float32)
+    frame["observation.images.cam_left"] = torch.tensor(frame["observation.images.cam_left"], dtype=torch.float32)
+    frame["observation.images.cam_right"] = torch.tensor(frame["observation.images.cam_right"], dtype=torch.float32)
+    
 
     # Convert to float32 with image from channel first in [0,255]
     # to channel last in [0,1]
-    state = state.to(torch.float32)
-    left_img = left_img.to(torch.float32) / 255
-    right_img = right_img.to(torch.float32) / 255
+    state = frame["observation.state"]
+    left_img = frame["observation.images.cam_left"] / 255
+    right_img = frame["observation.images.cam_right"] / 255
+
+    # make image channel first
+    left_img = left_img.permute(2, 0, 1)
+    right_img = right_img.permute(2, 0, 1)
 
     # Send data tensors from CPU to GPU
     state = state.to(device, non_blocking=True)
@@ -121,27 +149,34 @@ while not done:
     state = state.unsqueeze(0)
     left_img = left_img.unsqueeze(0)
     right_img = right_img.unsqueeze(0)
+    import pdb; pdb.set_trace()  # Debugging breakpoint
 
     # Create the policy input dictionary
     observation = {
-        "observation.state": state,
-        "observation.images.cam_left": left_img,
-        "observation.images.cam_right": right_img,
+        "observation.state": state, 
+        "observation.images.cam_left": left_img, 
+        "observation.images.cam_right": right_img, 
     }
 
     # Predict the next action with respect to the current observation
     with torch.inference_mode():
         action = policy.select_action(observation)
-        print(f"Step {step}: Predicted action: {action}")
+        # print(f"Step {step}: Predicted action: {action}")
 
     # Prepare the action for the environment
     numpy_action = action.squeeze(0).to("cpu").numpy()
+    # L2 norm of the error between the predicted action and the ground truth action
+    ground_truth_action = all_action[i]
+    error = np.linalg.norm(numpy_action - ground_truth_action)
+    print(f"Step {step}: Jaw action: {numpy_action[-1]} Error: {error}")
 
-
-
+    accumulated_error += error
 
     # The rollout is considered done when the success state is reached (i.e. terminated is True),
     # or the maximum number of iterations is reached (i.e. truncated is True)
     step += 1
-    done = step >= 10  # For this example, we stop after 10 steps
+    if step >= episode_length:
+        print(f"Episode {id} finished after {step} steps.")
+        print(f"Accumulated error: {accumulated_error}")
+        import pdb; pdb.set_trace()  # Debugging breakpoint
 

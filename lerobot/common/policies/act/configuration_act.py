@@ -94,16 +94,7 @@ class ACTConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 100
-    # # Input shapes.
-    # input_shapes: dict[str, list[int]] = field(
-    #     default_factory=lambda: {
-    #         "observation.state": [7],  # Environment state features
-    #     }
-    # )
-    # # Output shapes.
-    # output_shapes = {
-    #     "action": [7],  # 7-dimensional actions
-    # }
+    
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -112,6 +103,9 @@ class ACTConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
+
+    # Extra Observations
+    dissection_target_feature: bool = True  # Whether to use dissection target as an observation
 
     # Architecture.
     # Vision backbone.

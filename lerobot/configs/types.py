@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 class FeatureType(str, Enum):
     STATE = "STATE"
+    DISSECTION = "DISSECTION"
     VISUAL = "VISUAL"
     ENV = "ENV"
     ACTION = "ACTION"

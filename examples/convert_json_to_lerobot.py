@@ -27,6 +27,8 @@ from typing import Literal, List, Dict, Optional
 
 from lerobot.common.constants import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from action_utils import *
+from utils import uniform_sampling_numpy
 
 
 # migrate from unitree_lerobot.utils.constants import ROBOT_CONFIGS
@@ -66,8 +68,8 @@ ROBOT_CONFIGS = {
 class DatasetConfig:
     use_videos: bool = True
     tolerance_s: float = 0.0001
-    image_writer_processes: int = 10
-    image_writer_threads: int = 5
+    image_writer_processes: int = 10*5
+    image_writer_threads: int = 5*5
     video_backend: str | None = None
 
 
@@ -86,7 +88,10 @@ class JsonDataset:
         assert robot_type is not None, "Robot type cannot be None"
         self.data_dirs = data_dirs
         self.json_file = 'data.json'
-        
+
+        # load Q: perspective transformation matrix to reconstruct point clouds from disparities
+        self.Q = np.load("Q.npy")
+
         # Initialize paths and cache
         self._init_paths()
         self._init_cache()
@@ -105,7 +110,7 @@ class JsonDataset:
                 episode_paths = glob.glob(os.path.join(task_path, '*'))
                 if episode_paths:
                     self.task_paths.append(task_path)
-                    self.episode_paths.append(episode_paths[0]) # only take the data.json path, ignore colors/
+                    self.episode_paths.append(episode_paths[1]) # only take the data.json path, ignore colors/
         
         self.episode_paths = sorted(self.episode_paths)
         self.episode_ids = list(range(len(self.episode_paths)))
@@ -158,7 +163,7 @@ class JsonDataset:
         """Load and stack images for a given camera key."""
 
         images = defaultdict(list)
-
+        
         keys = episode_data["data"][0]['colors'].keys()
         cameras = [key for key in keys if "depth" not in key]
         for camera in cameras:
@@ -172,50 +177,77 @@ class JsonDataset:
                     continue
 
                 image_path = os.path.join(episode_path, relative_path)
+                if camera == "left_image":
+                    # derive relative / absolute depth path
+                    rel_depth = (
+                        Path(relative_path)
+                        .with_name(Path(relative_path).name       # left_image_000000.jpg → left_depth_000000.jpg
+                                .replace("left_image_", "left_depth_"))
+                        .with_suffix(".png")                  # jpg → png
+                    )
+                else:
+                    rel_depth = (
+                        Path(relative_path)
+                        .with_name(Path(relative_path).name       # right_image_000000.jpg → right_depth_000000.jpg
+                                .replace("right_image_", "right_depth_"))
+                        .with_suffix(".png")                  # jpg → png
+                    )
+                depth_path = Path(episode_path) / str(rel_depth).replace("colors", "depths")
                 if not os.path.exists(image_path):
                     raise FileNotFoundError(f"Image path does not exist: {image_path}")
 
-                image = cv2.imread(image_path)
+                image = cv2.imread(depth_path)
+                # image = cv2.imread(image_path)
                 if image is None:
-                    raise RuntimeError(f"Failed to read image: {image_path}")
+                    if images[image_key]:
+                        # copy() so later in‑place ops don’t mutate previous frame
+                        images[image_key].append(images[image_key][-1].copy())
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"First depth frame missing: {depth_path}"
+                        )
 
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 images[image_key].append(image_rgb)
 
         return images
     
-    # def _process_retraction_episode(
-    #         self,
-    #         episode_data: Dict,
-    #         part_key: str = "psm_retraction_js",
-    #     ) -> tuple[np.ndarray, np.ndarray]:
-    #     """
-    #     Return (state, action) for the retraction arm only.
-
-    #     • state  : shape (T, 7)  [qpos(6), gripper(1)]
-    #     • action : shape (T, 7)  Δ-state; last frame is 0-vector
-    #     """
-    #     # ----– collect joint + gripper per frame –--------------------------------
-    #     states = []
-    #     for sample in episode_data["data"]:
-    #         js    = sample["states"][part_key]
-    #         qpos  = js["qpos"]                 # 6-dim list
-    #         grip  = js["gripper"]              # scalar
-    #         states.append(qpos + [grip])       # 7-dim
-
-    #     states = np.asarray(states, dtype=np.float32)      # (T, 7)
-
-    #     # ----– first-order finite difference → action –---------------------------
-    #     actions            = np.zeros_like(states)         # (T, 7)
-        # actions[:-1]       = states[1:] - states[:-1]      # Δq_t
-    #     # actions[-1] is already zero
-
-    #     return states, actions
+    def _reconstruct_point_clouds(self, episode_path: str):
+        """
+        Reconstruct point clouds from disparities.
+        
+        Args:
+            episode_path: Path to the episode directory
+            
+        Returns:
+            Point clouds as a numpy array of shape (T, 4096, 3)
+        """
+        point_clouds = []
+        disp_path = os.path.join(episode_path, "disparities", "disparities_episode.npy")
+        disps = np.load(disp_path, allow_pickle=True) if os.path.exists(disp_path) else None
+        if disps is None:
+            raise FileNotFoundError(f"Disparity file not found: {disp_path}")
+        for disp in disps:
+            # Assuming depth_img is a single-channel image with depth values
+            points = cv2.reprojectImageTo3D(disp.squeeze(0), self.Q).reshape(-1, 3)  # Reshape to (N, 3)
+            points = uniform_sampling_numpy(points[None, ...], 4096).squeeze(0)  # (4096, 3)
+            point_clouds.append(points)
+        # Convert to numpy array of shape (T, 4096, 3)
+        point_clouds = np.array(point_clouds, dtype=np.float32)
+        # some sanity checks
+        if point_clouds.shape[0] == 0:
+            raise ValueError("No valid depth images found in the episode data.")
+        if point_clouds.shape[1] != 4096:
+            raise ValueError(f"Expected 4096 points per frame, got {point_clouds.shape[1]} points.")
+        return point_clouds
+    
     
     def _process_retraction_episode(
         self,
         episode_data: Dict,
-        part_key: str = "psm_retraction_js",
+        concat_states: bool = True,
+        rel_ee_actions: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Returns (states, actions) for one episode.
@@ -224,47 +256,94 @@ class JsonDataset:
         actions : (T-1,7) -> *target* joint pos at t+1 (absolute), last sample dropped
         """
         # ---------- Collect joint + gripper per frame ----------
+        dissection_tar = []
         qtraj = []
+        qvel = []
+        qeffort = []
+        ee_frames = []
+        gripper = []
+        action = []
         for sample in episode_data["data"]:
-            js   = sample["states"][part_key]
-            qpos = js["qpos"]          # 6-D list
-            grip = js["gripper"]       # scalar
-            qtraj.append(qpos + [grip])
+            # robot states
+            js   = sample["states"]["psm_retraction_js"]
+            # dissection target points in pixel coordinates
+            dissection_tar_ = sample["states"]["dissection_target"]["points"]
+            dissection_tar_ = np.array(dissection_tar_).flatten().astype(np.int32)
+            # end-effector frames 
+            ee_frames_pos = sample["states"]["psm_retraction_ee"]["psm_retraction_pos"]
+            ee_frames_quat = sample["states"]["psm_retraction_ee"]["psm_retraction_quat"]
+            ee_frames_ = np.concatenate([ee_frames_pos, ee_frames_quat])
+            # states
+            qpos_ = js["qpos"]          # 6-D list
+            qvel_ = js["qvel"]          # 6-D list
+            qeffort_ = js["qeffort"]    # 6-D list
+            grip = js["gripper"]        # scalar
+            if concat_states:
+                qtraj.append(qpos_ + [grip] + qvel_ + qeffort_)
+            else:
+                qtraj.append(qpos_ + [grip])
+                qvel.append(qvel_)  
+                qeffort.append(qeffort_)  
+                
+            ee_frames.append(ee_frames_) 
+            dissection_tar.append(dissection_tar_)
+            gripper.append(grip)
+            if rel_ee_actions:
+                action = None
+            else:
+                action.append(qpos_ + [grip]) # use current joint positions as action
 
         states = np.asarray(qtraj, dtype=np.float32)           # (T,7)
+        qvel = np.asarray(qvel, dtype=np.float32)             # (T,7)
+        qeffort = np.asarray(qeffort, dtype=np.float32)       # (T,7)
+        
+        ee_frames = np.asarray(ee_frames, dtype=np.float32)   # (T,7)
+        dissection_tar = np.asarray(dissection_tar, dtype=np.float32)  # (T, 8)
+        gripper = np.asarray(gripper, dtype=np.float32)       # (T,1)
 
-        # ---------- Create one-step-ahead targets --------------
-        # Drop the final frame because it has no “next” pose.
-        actions = states[1:].copy()                            # (T-1,7)
+        if rel_ee_actions:
+            actions_ = tool_centric_relative_actions(torch.from_numpy(ee_frames))  # (T-1, 4, 4)
+            actions = se3_to_10d_actions(actions_, torch.from_numpy(gripper[:-1]))  # (T-1, 10)
+        else:
+            action = np.asarray(action, dtype=np.float32)         # (T,7)
+            # ---------- Create one-step-ahead targets --------------
+            # Drop the final frame because it has no “next” pose.
+            actions = action[1:].copy()                            # (T-1,7)
 
-        # Return sequences of equal length (optional):
-        # states[:-1], actions
-        return states[:-1], actions
+        if concat_states:
+            # Drop the last frame of states, actions, qvel, qeffort, dissection_tar
+            return states[:-1], actions, dissection_tar[:-1]
+        else:
+            return states[:-1], actions, qvel[:-1], qeffort[:-1], dissection_tar[:-1]
 
 
 
-    def get_item(self, index: Optional[int] = None,) -> Dict:
+    def get_item(self, index: Optional[int] = None, concat_states: bool = False) -> Dict:
         """Get a training sample from the dataset.  """
             
         file_path = np.random.choice(self.episode_paths) if index is None else self.episode_paths[index]
         episode_data = self.episodes_data_cached[index]
 
-        # Load state and action data (retraction only)
-        state, action = self._process_retraction_episode(episode_data)
-        # state = self._extract_data(episode_data, 'states', self.json_state_data_name)
-        # action = self._extract_data(episode_data, 'actions', self.json_action_data_name)
+        if concat_states:
+            # Load state and action data (retraction only)
+            state, action, dissection_tar = self._process_retraction_episode(episode_data, concat_states=True)
+        else:
+            state, action, qvel, qeffort, dissection_tar = self._process_retraction_episode(episode_data, concat_states=False)
+            
         episode_length = len(state)
+
+        # Ensure state and action have the same length
         state_dim = state.shape[1] if len(state.shape) == 2 else state.shape[0]
-        # Fake action for now, as we don't have actions in the JSON dataset
-        # action = np.zeros((episode_length, state.shape[1]), dtype=np.float32)  # Fake action data
         action_dim = action.shape[1] if len(action.shape) == 2 else state.shape[0]
-        
-        # Load task descriptionJ
+
+        # Load task description
         task = episode_data.get('text', {}).get('goal', "")
         
         # Load camera images
         cameras = self._parse_images(file_path[:-9], episode_data) #ignore the last 9 characters which is data.json
 
+        # Reconstruct point clouds (T, 4096, 3)
+        point_clouds = self._reconstruct_point_clouds(file_path[:-9]) 
         # Extract camera configuration
         cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
         data_cfg = {
@@ -274,14 +353,28 @@ class JsonDataset:
             'state_dim': state_dim,
             'action_dim': action_dim,
         }
-        
-        return {'episode_index': index,
-                'episode_length': episode_length,
-                'state': state, 
-                'action': action,
-                'cameras': cameras,
-                'task': task,
-                'data_cfg':data_cfg}
+        if concat_states:
+            return {'episode_index': index,
+                    'episode_length': episode_length,
+                    'state': state, 
+                    'dissection_tar': dissection_tar,
+                    'point_clouds': point_clouds,
+                    'action': action,
+                    'cameras': cameras,
+                    'task': task,
+                    'data_cfg':data_cfg}
+        else:
+            return {'episode_index': index,
+                    'episode_length': episode_length,
+                    'state': state, 
+                    'dissection_tar': dissection_tar,
+                    'point_clouds': point_clouds,
+                    'action': action,
+                    'qvel': qvel,
+                    'qeffort': qeffort,
+                    'cameras': cameras,
+                    'task': task,
+                    'data_cfg':data_cfg}
 
 
 def create_empty_dataset(
@@ -289,8 +382,10 @@ def create_empty_dataset(
     robot_type: str,
     mode: Literal["video", "image"] = "video",
     *,
+    has_point_cloud: bool = False,
     has_velocity: bool = False,
     has_effort: bool = False,
+    has_dissection_target: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
     FPS: int = 30,
 ) -> LeRobotDataset:
@@ -301,24 +396,35 @@ def create_empty_dataset(
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (7,), # 6 joints + 1 gripper
+            "shape": (19,), # 6 joints + 1 gripper + 6 velocity + 6 effort
             "names": [
                 motors,
             ],
         },
         "action": {
             "dtype": "float32",
-            "shape": (7,), # 6 joints + 1 gripper (relative joint values)
+            "shape": (7,), # 3 pos + 6D orientation + gripper  # 6 joints + 1 gripper (relative joint values)
             "names": [
                 motors,
             ],
         },
     }
 
+    if has_point_cloud:
+        features["observation.point_cloud"] = {
+            "dtype": "float32",
+            "shape": (4096, 3),  # 3D points, 4096 points per frame
+            "names": [
+                "x",
+                "y",
+                "z",
+            ],
+        }
+
     if has_velocity:
         features["observation.velocity"] = {
             "dtype": "float32",
-            "shape": (len(motors),),
+            "shape": (6,), # without gripper
             "names": [
                 motors,
             ],
@@ -327,9 +433,25 @@ def create_empty_dataset(
     if has_effort:
         features["observation.effort"] = {
             "dtype": "float32",
-            "shape": (len(motors),),
+            "shape": (6,), # without gripper
             "names": [
                 motors,
+            ],
+        }
+
+    if has_dissection_target:
+        features["observation.dissection_tar"] = {
+            "dtype": "float32",
+            "shape": (8,), # without gripper
+            "names": [
+                "first_point_px",
+                "first_point_py",
+                "second_point_px",
+                "second_point_py",
+                "third_point_px",
+                "third_point_py",
+                "fourth_point_px",
+                "fourth_point_py",
             ],
         }
 
@@ -359,34 +481,64 @@ def create_empty_dataset(
         video_backend=dataset_config.video_backend,
     )
 
+def process_disscection_target(
+    dissection_tar: np.ndarray,
+) -> np.ndarray:
+    """
+    Process dissection target to ensure it has exactly 8 points.
+    If more than 8 points are provided, truncate to the first 8.
+    """
+    if dissection_tar.shape[0] > 8:
+        # discard the first point 
+        dissection_tar = dissection_tar[:8]
+        print(f"Warning: Dissection target has more than 8 points, truncating to 8 points.")
+    return dissection_tar
 
 def populate_dataset(
     dataset: LeRobotDataset,
     raw_dir: Path,
     robot_type: str,
+    concat_states: bool = True,
 ) -> LeRobotDataset:
     
     json_dataset = JsonDataset(raw_dir, robot_type)
     for i in tqdm.tqdm(range(len(json_dataset))):
-        episode = json_dataset.get_item(i)
-
+        episode = json_dataset.get_item(i, concat_states=concat_states)
         state = episode["state"]
         action = episode["action"]
         cameras = episode["cameras"]
         task = episode["task"]
         episode_length = episode["episode_length"]
+        dissection_tar = episode["dissection_tar"]
+        point_clouds = episode["point_clouds"]
+
+        if concat_states==False:
+            qvel = episode["qvel"]
+            qeffort = episode["qeffort"]
 
         num_frames = episode_length
         for i in range(num_frames):
-            frame = {
-                "observation.state": state[i],
-                "action": action[i],
-                "task": task
-            }
-
+            if concat_states:
+                frame = {
+                    "observation.state": state[i],
+                    "action": action[i],
+                    "task": task,
+                    "observation.dissection_tar": process_disscection_target(dissection_tar[i]),
+                    "observation.point_cloud": point_clouds[i],
+                } 
+            else:
+                # With separate velocity and effort
+                frame = {
+                    "observation.state": state[i],
+                    "action": action[i],
+                    "task": task,
+                    "observation.velocity": qvel[i],
+                    "observation.effort": qeffort[i],
+                    "observation.dissection_tar": process_disscection_target(dissection_tar[i]),
+                }
+                
             for camera, img_array in cameras.items():
                 frame[f"observation.images.{camera}"] = img_array[i]
-
             dataset.add_frame(frame)
 
         dataset.save_episode()
@@ -410,11 +562,13 @@ def json_to_lerobot(
     dataset = create_empty_dataset(
         repo_id,
         robot_type=robot_type,
-        mode=mode,
-        has_effort=False,
-        has_velocity=False,
+        mode=mode, 
+        has_point_cloud=True, 
+        has_effort=False, # False means effort is not stored separately
+        has_velocity=False, # False means velocity is not stored separately
+        has_dissection_target=True,
         dataset_config=dataset_config,
-        FPS=15,  # Assuming a default FPS of 30
+        FPS=30,  # Assuming a default FPS of 30
     )
     dataset = populate_dataset(
         dataset,

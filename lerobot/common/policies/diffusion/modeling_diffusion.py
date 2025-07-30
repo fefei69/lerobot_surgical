@@ -33,7 +33,7 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
 
-from lerobot.common.constants import OBS_ENV, OBS_ROBOT
+from lerobot.common.constants import OBS_DISSECTION_TAR, OBS_ENV, OBS_ROBOT
 from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
@@ -92,6 +92,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         """Clear observation and action queues. Should be called on `env.reset()`"""
         self._queues = {
             "observation.state": deque(maxlen=self.config.n_obs_steps),
+            "observation.dissection_tar": deque(maxlen=self.config.n_obs_steps), # dissection target (check this carefully)
             "action": deque(maxlen=self.config.n_action_steps),
         }
         if self.config.image_features:
@@ -174,9 +175,11 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
-
+        
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
+        # dissection target (check this carefully)
+        global_cond_dim += 8
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -240,6 +243,7 @@ class DiffusionModel(nn.Module):
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
         global_cond_feats = [batch[OBS_ROBOT]]
+        global_cond_feats.append(batch[OBS_DISSECTION_TAR])  # dissection target (check this carefully)
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:

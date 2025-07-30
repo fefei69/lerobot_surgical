@@ -314,6 +314,14 @@ class ACT(nn.Module):
                 self.vae_encoder_robot_state_input_proj = nn.Linear(
                     self.config.robot_state_feature.shape[0], config.dim_model
                 )
+
+            if self.config.dissection_target_feature:
+                # TODO: Define this in the config
+                # Additional states projection
+                self.vae_encoder_dissection_target_input_proj = nn.Linear(
+                    8, config.dim_model
+                )
+            
             # Projection layer for action (joint-space target) to hidden dimension.
             self.vae_encoder_action_input_proj = nn.Linear(
                 self.config.action_feature.shape[0],
@@ -326,6 +334,8 @@ class ACT(nn.Module):
             num_input_token_encoder = 1 + config.chunk_size
             if self.config.robot_state_feature:
                 num_input_token_encoder += 1 
+            if self.config.dissection_target_feature:
+                num_input_token_encoder += 1 # NOTE: dissection_target (check this carefully)
             self.register_buffer(
                 "vae_encoder_pos_enc",
                 create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
@@ -363,6 +373,13 @@ class ACT(nn.Module):
             self.encoder_robot_state_input_proj = nn.Linear(
                 self.config.robot_state_feature.shape[0], config.dim_model
             )
+
+        if self.config.dissection_target_feature:
+            # NOTE: Projection layer for the dissection target (check this carefully)
+            self.encoder_dissection_target_input_proj = nn.Linear(
+                8, config.dim_model
+            )
+
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
                 self.config.env_state_feature.shape[0], config.dim_model
@@ -379,7 +396,9 @@ class ACT(nn.Module):
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
-            n_1d_tokens += 1
+            n_1d_tokens += 1 
+        if self.config.dissection_target_feature:
+            n_1d_tokens += 1 # NOTE: for the dissection target (check this carefully)
         if self.config.env_state_feature:
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
@@ -439,6 +458,9 @@ class ACT(nn.Module):
             if self.config.robot_state_feature:
                 robot_state_embed = self.vae_encoder_robot_state_input_proj(batch["observation.state"])
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D) already (B, S, D) if using delta_timestamps
+                robot_state_diss_targ_embed = self.vae_encoder_dissection_target_input_proj(batch["observation.dissection_tar"])
+                robot_state_diss_targ_embed = robot_state_diss_targ_embed.unsqueeze(1)  # (B, 1, D)
+                robot_state_embed = torch.cat([robot_state_embed, robot_state_diss_targ_embed], dim=1)  # (B, 2, D) if using robot state and dissection target
             action_embed = self.vae_encoder_action_input_proj(batch["action"])  # (B, S, D)
 
             if self.config.robot_state_feature:
@@ -456,10 +478,11 @@ class ACT(nn.Module):
             # sequence depending whether we use the input states or not (cls and robot state)
             # False means not a padding token.
             cls_joint_is_pad = torch.full(
-                (batch_size, 2 if self.config.robot_state_feature else 1),
+                (batch_size, 3 if self.config.dissection_target_feature else 2), # NOTE: 3 if using robot state and dissection target, assume robot state will be used (check this carefully)
                 False,
                 device=batch["observation.state"].device,
             )
+            
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
             )  # (bs, seq+1 or 2)
@@ -492,6 +515,8 @@ class ACT(nn.Module):
         # Robot state token.
         if self.config.robot_state_feature:
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
+            # Dissection target token.
+            encoder_in_tokens.append(self.encoder_dissection_target_input_proj(batch["observation.dissection_tar"]))
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(

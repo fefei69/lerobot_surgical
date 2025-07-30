@@ -101,6 +101,14 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     @abc.abstractmethod
     def validate_features(self) -> None:
         raise NotImplementedError
+    
+    @property
+    def dissection_target_feature(self) -> PolicyFeature | None:
+        for _, ft in self.input_features.items():
+            import pdb; pdb.set_trace()  # noqa: T201
+            if ft.type is FeatureType.DISSECTION:
+                return ft
+        return None
 
     @property
     def robot_state_feature(self) -> PolicyFeature | None:

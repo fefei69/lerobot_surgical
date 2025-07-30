@@ -230,6 +230,33 @@ class JsonDataset:
                 'data_cfg':data_cfg}
     
 
+def shuffle_point_numpy(point_cloud):
+    B, N, C = point_cloud.shape
+    indices = np.random.permutation(N)
+    return point_cloud[:, indices]
+
+def pad_point_numpy(point_cloud, num_points):
+    B, N, C = point_cloud.shape
+    if num_points > N:
+        num_pad = num_points - N
+        pad_points = np.zeros((B, num_pad, C))
+        point_cloud = np.concatenate([point_cloud, pad_points], axis=1)
+        point_cloud = shuffle_point_numpy(point_cloud)
+    return point_cloud
+
+def uniform_sampling_numpy(point_cloud, num_points):
+    B, N, C = point_cloud.shape
+    # padd if num_points > N
+    if num_points > N:
+        return pad_point_numpy(point_cloud, num_points)
+    
+    # random sampling
+    indices = np.random.permutation(N)[:num_points]
+    sampled_points = point_cloud[:, indices]
+    return sampled_points
+
+
+
 def main():
     json_dataset = JsonDataset('dataset/', 'DVRK')
 

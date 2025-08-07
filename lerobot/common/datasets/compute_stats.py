@@ -91,12 +91,26 @@ def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], featu
             ep_ft_array = sample_images(data)  # data is a list of image paths
             axes_to_reduce = (0, 2, 3)  # keep channel dim
             keepdims = True
+        elif key == "observation.point_cloud":
+            ep_ft_array = data  # data is already a np.ndarray
+            mask_inf = np.isinf(ep_ft_array).any(axis=-1)  # True if any coord is ±inf
+            mask_nan = np.isnan(ep_ft_array).any(axis=-1)  # True if any coord is NaN
+
+            num_inf_points = mask_inf.sum()
+            num_nan_points = mask_nan.sum()
+            print(f"Point cloud stats: {num_inf_points} points with inf, {num_nan_points} points with NaN")
+            axes_to_reduce = tuple(range(ep_ft_array.ndim - 1))  # compute stats over the first axis
+            keepdims = True # keep (1,3)
         else:
             ep_ft_array = data  # data is already a np.ndarray
             axes_to_reduce = 0  # compute stats over the first axis
             keepdims = data.ndim == 1  # keep as np.array
 
         ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
+        if key =="observation.point_cloud":
+            ep_stats[key] = {
+                k: v if k == "count" else np.squeeze(v, axis=0) for k, v in ep_stats[key].items()
+            }
 
         # finally, we normalize and remove batch dim for images
         if features[key]["dtype"] in ["image", "video"]:

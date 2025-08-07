@@ -39,6 +39,8 @@ from lerobot.common.policies.pretrained import PreTrainedPolicy
 
 from transformers import AutoBackbone
 
+from lerobot.common.pointnet2_models.pointnet2_cls_ssg import PointNet2Encoder 
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -63,7 +65,7 @@ class ACTPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-
+        
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
@@ -118,6 +120,7 @@ class ACTPolicy(PreTrainedPolicy):
         self.eval()
 
         batch = self.normalize_inputs(batch)
+        print("Normalized Inputs:", batch['observation.point_cloud'])
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = [batch[key] for key in self.config.image_features]
@@ -315,7 +318,7 @@ class ACT(nn.Module):
                     self.config.robot_state_feature.shape[0], config.dim_model
                 )
 
-            if self.config.dissection_target_feature:
+            if self.config.use_dissection_target_feature:
                 # TODO: Define this in the config
                 # Additional states projection
                 self.vae_encoder_dissection_target_input_proj = nn.Linear(
@@ -334,7 +337,7 @@ class ACT(nn.Module):
             num_input_token_encoder = 1 + config.chunk_size
             if self.config.robot_state_feature:
                 num_input_token_encoder += 1 
-            if self.config.dissection_target_feature:
+            if self.config.use_dissection_target_feature:
                 num_input_token_encoder += 1 # NOTE: dissection_target (check this carefully)
             self.register_buffer(
                 "vae_encoder_pos_enc",
@@ -362,6 +365,21 @@ class ACT(nn.Module):
                 # freeze the backbone's weights
                 backbone_model.requires_grad_(False)
                 self.backbone = backbone_model 
+        
+        if self.config.use_point_cloud_feature:
+            # PointNet2 model for point cloud feature extraction.
+            self.pointnet = PointNet2Encoder(normal_channel=False)
+            # Load the pretrained weights for the PointNet2 model. (check this carefully)
+            raw = torch.load(config.pretrained_pointnet_weights,
+                             weights_only=False)
+            self.pointnet.load_state_dict(raw['model_state_dict'], strict=False)
+            # sd  = raw.get("model_state_dict", raw.get("state_dict", raw))
+            # sd  = {k.replace("module.", ""): v for k, v in sd.items()
+            #         if k.startswith(('sa1', 'sa2', 'sa3'))}
+            
+            # self.pointnet.load_state_dict(sd, strict=False)   # head params are ignored
+            # freeze the PointNet2 model's weights
+            # self.pointnet.requires_grad_(False)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -374,7 +392,7 @@ class ACT(nn.Module):
                 self.config.robot_state_feature.shape[0], config.dim_model
             )
 
-        if self.config.dissection_target_feature:
+        if self.config.use_dissection_target_feature:
             # NOTE: Projection layer for the dissection target (check this carefully)
             self.encoder_dissection_target_input_proj = nn.Linear(
                 8, config.dim_model
@@ -393,12 +411,20 @@ class ACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 in_feats, config.dim_model, kernel_size=1
             )
+        if self.config.use_point_cloud_feature:
+            in_feats = 1024  # e.g. 1024 for PointNet2 NOTE: This is hardcoded for PointNet2, check this carefully.
+            # Projection layer for the point cloud features to the hidden dimension.
+            self.encoder_point_cloud_input_proj = nn.Linear(
+                in_feats, config.dim_model
+            )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
             n_1d_tokens += 1 
-        if self.config.dissection_target_feature:
+        if self.config.use_dissection_target_feature:
             n_1d_tokens += 1 # NOTE: for the dissection target (check this carefully)
+        if self.config.use_point_cloud_feature:
+            n_1d_tokens += 1 # NOTE: for the point cloud feature (check this carefully)
         if self.config.env_state_feature:
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
@@ -478,7 +504,7 @@ class ACT(nn.Module):
             # sequence depending whether we use the input states or not (cls and robot state)
             # False means not a padding token.
             cls_joint_is_pad = torch.full(
-                (batch_size, 3 if self.config.dissection_target_feature else 2), # NOTE: 3 if using robot state and dissection target, assume robot state will be used (check this carefully)
+                (batch_size, 3 if self.config.use_dissection_target_feature else 2), # NOTE: 3 if using robot state and dissection target, assume robot state will be used (check this carefully)
                 False,
                 device=batch["observation.state"].device,
             )
@@ -522,6 +548,11 @@ class ACT(nn.Module):
             encoder_in_tokens.append(
                 self.encoder_env_state_input_proj(batch["observation.environment_state"])
             )
+        if self.config.use_point_cloud_feature:
+            # Point cloud feature token.
+            pc = batch["observation.point_cloud"].permute(0, 2, 1).contiguous() # (B, N, 3) -> (B, 3, N) pointnet expects channel first
+            pc_features = self.pointnet(pc)
+            encoder_in_tokens.append(self.encoder_point_cloud_input_proj(pc_features)) # NOTE: check this carefully
         # Camera observation features and positional embeddings.
         if self.config.image_features:
             all_cam_features = []

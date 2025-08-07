@@ -1,11 +1,11 @@
 # which python 
-# export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 # python examples/convert_json_to_lerobot.py --raw-dir /workspace/dataset/surgical_learning --repo-id cpw/test --robot-type DVRK 
 # python examples/convert_json_to_lerobot.py --raw-dir /workspace/dataset/phantom_retraction_first_direction --repo-id cpw/real_world_retraction_first_direction_future_js_predict --robot-type DVRK 
-python examples/convert_json_to_lerobot.py \
-    --raw-dir /workspace/dataset/disp_toy_data \
-    --repo-id cpw/test_disp \
-    --robot-type DVRK 
+# python examples/convert_json_to_lerobot.py \
+#     --raw-dir /workspace/dataset/0718_retraction_data_30hz_w_depth_disp \
+#     --repo-id cpw/0718_retraction_data_30hz_w_depth_disp \
+#     --robot-type DVRK 
 # examples
 
 # Bechmarking the training of a policy using the ALOHA dataset with DINOv2 backbone
@@ -21,14 +21,22 @@ python examples/convert_json_to_lerobot.py \
 
 
 # Real-world retraction dataset training with default settings (Resnet)
-# export CUDA_VISIBLE_DEVICES=1 
+# export CUDA_VISIBLE_DEVICES=0 
+python lerobot/scripts/train.py \
+    --policy.type=act \
+    --dataset.repo_id=cpw/0718_retraction_data_30hz_w_depth_disp \
+    --output_dir=outputs/train/act_retraction_predict_js_30hz_eff_vel_depimg_pc \
+    --job_name=act_retraction_predict_js_30hz_eff_vel_depimg_pc \
+    --wandb.enable=true
+
+# Testing the policy training with a small dataset
+# export CUDA_VISIBLE_DEVICES=0 
 # python lerobot/scripts/train.py \
 #     --policy.type=act \
-#     --dataset.repo_id=cpw/real_world_retraction_js_30hz_concat_eff_vel_dep \
-#     --output_dir=outputs/train/test \
+#     --dataset.repo_id=cpw/test_temp \
+#     --output_dir=outputs/train/test_act \
 #     --job_name=test_temp \
 #     --wandb.enable=true
-
 
 # python lerobot/scripts/train.py \
 #     --policy.type=act \

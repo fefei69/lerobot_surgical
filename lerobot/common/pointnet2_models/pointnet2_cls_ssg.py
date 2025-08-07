@@ -35,9 +35,27 @@ class get_model(nn.Module):
         x = self.fc3(x)
         x = F.log_softmax(x, -1)
 
-
         return x, l3_points
 
+
+class PointNet2Encoder(nn.Module):
+    def __init__(self, normal_channel: bool = False):
+        super().__init__()
+        in_ch = 6 if normal_channel else 3
+        self.sa1 = PointNetSetAbstraction(512, 0.2, 32, in_ch, [64, 64, 128], False)
+        self.sa2 = PointNetSetAbstraction(128, 0.4, 64, 128 + 3, [128, 128, 256], False)
+        self.sa3 = PointNetSetAbstraction(None, None, None, 256 + 3, [256, 512, 1024], True)
+        self.output_dim = 1024  # Output dimension after the last set abstraction layer
+        
+    def forward(self, xyz):           # xyz: (B, C, N)
+        if xyz.shape[1] > 3:          # split normals if provided
+            norm, xyz = xyz[:, 3:], xyz[:, :3]
+        else:
+            norm = None
+        _, l1_pts = self.sa1(xyz, norm)
+        _, l2_pts = self.sa2(_, l1_pts)
+        _, l3_pts = self.sa3(_, l2_pts)   # (B, 1024, 1)
+        return l3_pts.squeeze(-1)         # (B, 1024)
 
 
 class get_loss(nn.Module):

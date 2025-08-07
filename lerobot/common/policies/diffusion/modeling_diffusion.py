@@ -44,6 +44,8 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 
+from lerobot.common.pointnet2_models.pointnet2_cls_ssg import PointNet2Encoder 
+
 
 class DiffusionPolicy(PreTrainedPolicy):
     """
@@ -92,11 +94,14 @@ class DiffusionPolicy(PreTrainedPolicy):
         """Clear observation and action queues. Should be called on `env.reset()`"""
         self._queues = {
             "observation.state": deque(maxlen=self.config.n_obs_steps),
-            "observation.dissection_tar": deque(maxlen=self.config.n_obs_steps), # dissection target (check this carefully)
             "action": deque(maxlen=self.config.n_action_steps),
         }
         if self.config.image_features:
             self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.use_dissection_target_feature:
+            self._queues["observation.dissection_tar"] = deque(maxlen=self.config.n_obs_steps) # dissection target (check this carefully)
+        if self.config.use_point_cloud_feature:
+            self._queues["observation.point_cloud"] = deque(maxlen=self.config.n_obs_steps) # point cloud feature (check this carefully)
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
 
@@ -178,8 +183,9 @@ class DiffusionModel(nn.Module):
         
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
-        # dissection target (check this carefully)
-        global_cond_dim += 8
+        if self.config.use_dissection_target_feature:
+            # dissection target (check this carefully)
+            global_cond_dim += 8 # assuming 4 points in image space
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -189,6 +195,15 @@ class DiffusionModel(nn.Module):
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
+        if self.config.use_point_cloud_feature:
+            # PointNet2 model for point cloud feature extraction.
+            self.pointnet = PointNet2Encoder(normal_channel=False)
+            # Load the pretrained weights for the PointNet2 model. (check this carefully)
+            raw = torch.load(config.pretrained_pointnet_weights,
+                             weights_only=False)
+            self.pointnet.load_state_dict(raw['model_state_dict'], strict=False)
+            assert self.pointnet.output_dim == 1024, "PointNet2 output dimension should be 1024."
+            global_cond_dim += self.pointnet.output_dim # PointNet2 output feature dimension
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
@@ -243,7 +258,8 @@ class DiffusionModel(nn.Module):
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
         global_cond_feats = [batch[OBS_ROBOT]]
-        global_cond_feats.append(batch[OBS_DISSECTION_TAR])  # dissection target (check this carefully)
+        if self.config.use_dissection_target_feature:
+            global_cond_feats.append(batch[OBS_DISSECTION_TAR])  # dissection target (check this carefully)
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -271,6 +287,19 @@ class DiffusionModel(nn.Module):
                     img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
                 )
             global_cond_feats.append(img_features)
+
+        # Extract point cloud features.
+        if self.config.use_point_cloud_feature:
+            # Combine batch and sequence dims before passing to the PointNet2 encoder.
+            point_clouds = einops.rearrange(batch["observation.point_cloud"], "b s n c -> (b s) n c")
+            # pointnet expects channel first, so permute to (B, N, C).
+            point_clouds = point_clouds.permute(0, 2, 1).contiguous()  # (B, C, N)
+            point_cloud_features = self.pointnet(point_clouds)
+            # Separate batch and sequence dims back out.
+            point_cloud_features = einops.rearrange(
+                point_cloud_features, "(b s) c -> b s c", b=batch_size, s=n_obs_steps
+            )
+            global_cond_feats.append(point_cloud_features)
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV])

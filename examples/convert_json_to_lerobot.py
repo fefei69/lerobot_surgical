@@ -28,7 +28,7 @@ from typing import Literal, List, Dict, Optional
 from lerobot.common.constants import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from action_utils import *
-from utils import uniform_sampling_numpy
+from utils import uniform_sampling_numpy, save_pointcloud_video
 
 
 # migrate from unitree_lerobot.utils.constants import ROBOT_CONFIGS
@@ -213,7 +213,77 @@ class JsonDataset:
 
         return images
     
-    def _reconstruct_point_clouds(self, episode_path: str):
+    def _count_disp_outliers(self, disp: np.ndarray, k_sigma: float = 3.0,
+                            iqr_scale: float = 1.5,
+                            pct_low: float = 0.5, pct_high: float = 99.5):
+        """
+        disp or point clouds : ndarray of shape (H, W) or (..., H, W)
+        k_sigma     : z-score cutoff; 3→ |d - μ| > 3σ
+        iqr_scale   : Tukey's rule; 1.5×IQR outside [Q1-IQR, Q3+IQR]
+        pct_low/high: percentile fences
+
+        returns dict with counts for each rule
+        """
+        flat = disp.flatten()  # flatten to 1D array
+        finite = np.isfinite(flat)
+        flat = flat[finite]                       # ignore inf / nan
+
+        # ---------- z-score rule ----------
+        mu, sigma = flat.mean(), flat.std()
+        mask_sigma = np.abs(flat - mu) > k_sigma * sigma
+
+        # ---------- IQR rule ----------
+        q1, q3 = np.percentile(flat, [25, 75])
+        iqr = q3 - q1
+        lo, hi = q1 - iqr_scale * iqr, q3 + iqr_scale * iqr
+        mask_iqr = (flat < lo) | (flat > hi)
+
+        # ---------- percentile rule ----------
+        lo_p, hi_p = np.percentile(flat, [pct_low, pct_high])
+        mask_pct = (flat < lo_p) | (flat > hi_p)
+
+        return {
+            "total_pixels" : flat.size,
+            f"|d-μ|>{k_sigma}σ" : mask_sigma.sum(),
+            f"Tukey 1.5×IQR"   : mask_iqr.sum(),
+            f"outside {pct_low}-{pct_high}%" : mask_pct.sum(),
+            "nan_or_inf"      : np.size(disp) - finite.sum()
+        }
+
+    def _point_cloud_sanity_check(self, point_clouds: np.ndarray):
+        stats = self._count_disp_outliers(point_clouds)  # Print outliers statistics
+        for k, v in stats.items():
+            print(f"{k:>18}: {v:,}")
+        return None
+
+    def _async_sanity_check(self, point_clouds: np.ndarray):
+
+        pc   = point_clouds          # (T, 4096, 3)
+        s    = 3                     # async_stride you used
+        T    = pc.shape[0]
+        tol  = 1e-6                  # numerical tolerance for equality
+
+        # 1) verify that frames which *should* be identical really are
+        mismatch_idx = []
+        for t in range(T):
+            base = (t // s) * s      # last “key” frame that was computed
+            if not np.allclose(pc[t], pc[base], atol=tol):
+                mismatch_idx.append(t)
+
+        if mismatch_idx:
+            print(f"❌  {len(mismatch_idx)} mismatches at frames {mismatch_idx}")
+        else:
+            print("✅  every frame is identical to its stride-3 anchor")
+
+        # 2) quick summary: where do clouds actually change?
+        changes = np.where(~np.isclose(
+                    np.linalg.norm(pc[1:] - pc[:-1], axis=(1,2)),
+                    0.0, atol=tol))[0] + 1          # indices where cloud differs
+
+        print(f"cloud recomputed at frames: {changes.tolist()}")
+    
+    # NOTE: Deprecated, use _reconstruct_point_clouds_async instead
+    def _reconstruct_point_clouds(self, episode_path: str, num_points: int = 4096) -> np.ndarray:
         """
         Reconstruct point clouds from disparities.
         
@@ -228,10 +298,13 @@ class JsonDataset:
         disps = np.load(disp_path, allow_pickle=True) if os.path.exists(disp_path) else None
         if disps is None:
             raise FileNotFoundError(f"Disparity file not found: {disp_path}")
+        epsilon = 1e-5  # Smallest allowable disparity
+        disps[disps < epsilon] = epsilon
         for disp in disps:
-            # Assuming depth_img is a single-channel image with depth values
+            # disp is a 2D disparity map
             points = cv2.reprojectImageTo3D(disp.squeeze(0), self.Q).reshape(-1, 3)  # Reshape to (N, 3)
-            points = uniform_sampling_numpy(points[None, ...], 4096).squeeze(0)  # (4096, 3)
+            points = uniform_sampling_numpy(points[None, ...], num_points).squeeze(0)  # (4096, 3)
+            self._point_cloud_sanity_check(points)  # Sanity check for outliers
             point_clouds.append(points)
         # Convert to numpy array of shape (T, 4096, 3)
         point_clouds = np.array(point_clouds, dtype=np.float32)
@@ -242,6 +315,65 @@ class JsonDataset:
             raise ValueError(f"Expected 4096 points per frame, got {point_clouds.shape[1]} points.")
         return point_clouds
     
+    
+    def _reconstruct_point_clouds_async(self,
+                                        episode_path: str,
+                                        num_points: int = 4096,
+                                        async_stride: int = 5) -> np.ndarray:
+        """
+        Reconstructs point clouds asynchronously:
+        • A fresh cloud is computed every `async_stride` frames
+        • For intermediate frames we *reuse* the last cloud so that
+        the returned array still has shape (T, num_points, 3).
+
+        Args
+        ----
+        episode_path : str   path to episode directory
+        num_points   : int   points to keep after uniform_sampling_numpy
+        async_stride : int   compute cloud only on frames 0, stride, 2·stride …
+
+        Returns
+        -------
+        np.ndarray  shape (T, num_points, 3)  dtype float32
+        """
+
+        ep_id = int(episode_path[-14:-10])  # get episode id from path
+        episode_path = episode_path[:-9]  # remove data.json from the path
+        # ---------- load disparities ----------
+        disp_path = os.path.join(episode_path, "disparities", f"disparities_{ep_id:04d}.npz")
+        if not os.path.exists(disp_path):
+            raise FileNotFoundError(f"Disparity file not found: {disp_path}")
+
+        # disps_ = np.load(disp_path, allow_pickle=True)           # (T, 1, H, W) or (T, H, W)
+        with np.load(disp_path, allow_pickle=True) as npz:
+            disps = npz['pred_disp']
+        epsilon = 1e-5
+        disps[disps < epsilon] = epsilon                        # avoid /0 → inf
+
+        point_clouds = []
+        last_cloud = None
+
+        # ---------- asynchronous loop ----------
+        for t, disp in enumerate(disps):
+            if t % async_stride == 0 or last_cloud is None:
+                # new stereo → depth → XYZ
+                pts = cv2.reprojectImageTo3D(disp, self.Q).reshape(-1, 3)
+                pts = uniform_sampling_numpy(pts[None, ...], num_points).squeeze(0)
+                self._point_cloud_sanity_check(pts)             # optional rejection
+                last_cloud = pts                                # cache latest
+            # reuse (broadcast) the cached cloud for non-key frames
+            point_clouds.append(last_cloud)
+
+        pc_array = np.asarray(point_clouds, dtype=np.float32)   # (T, P, 3)
+
+        # ---------- sanity checks ----------
+        if pc_array.shape[0] == 0:
+            raise ValueError("No valid point clouds reconstructed.")
+        if pc_array.shape[1] != num_points:
+            raise ValueError(f"Expected {num_points} pts, got {pc_array.shape[1]}.")
+
+        return pc_array
+
     
     def _process_retraction_episode(
         self,
@@ -341,9 +473,12 @@ class JsonDataset:
         
         # Load camera images
         cameras = self._parse_images(file_path[:-9], episode_data) #ignore the last 9 characters which is data.json
-
         # Reconstruct point clouds (T, 4096, 3)
-        point_clouds = self._reconstruct_point_clouds(file_path[:-9]) 
+        point_clouds = self._reconstruct_point_clouds_async(file_path, num_points=4096, async_stride=3) 
+        # self._async_sanity_check(point_clouds)  # Uncomment to check async point cloud reconstruction
+        # random_id = np.random.randint(0, 1000000)
+        # save_pointcloud_video(points_3d=point_clouds, out_path=f"pointcloud_traj_{random_id}.mp4", fps=30)
+
         # Extract camera configuration
         cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
         data_cfg = {

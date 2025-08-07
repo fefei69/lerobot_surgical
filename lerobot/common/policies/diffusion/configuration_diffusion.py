@@ -120,15 +120,20 @@ class DiffusionConfig(PreTrainedConfig):
     # which avoids excessive padding and leads to improved training results.
     drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
 
+    # Extra Observations
+    use_dissection_target_feature: bool = True  # Whether to use dissection target as an observation
+    use_point_cloud_feature: bool = True  # Whether to use point cloud as an observation
+
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    pretrained_pointnet_weights: str = "Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth"  # Path to the pretrained PointNet2 weights.
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
-    use_separate_rgb_encoder_per_camera: bool = False
+    use_separate_rgb_encoder_per_camera: bool = True
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5

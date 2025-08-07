@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from collections import defaultdict
 from typing import Literal, List, Dict, Optional
-
+import pyvista as pv
 
 # migrate from unitree_lerobot.utils.constants import ROBOT_CONFIGS
 @dataclasses.dataclass(frozen=True)
@@ -230,6 +230,52 @@ class JsonDataset:
                 'data_cfg':data_cfg}
     
 
+def reject_outliers_by_radius(
+        pts: np.ndarray,                  # (N, 3) float32 / float64
+        method: str       = "sigma",      # "abs" | "sigma" | "percentile"
+        abs_thresh: float = None,         # used when method == "abs"
+        k_sigma: float    = 3.0,          # used when method == "sigma"
+        pct: float        = 99.5          # used when method == "percentile"
+    ):
+    """
+    Returns
+    -------
+    inliers  : (M, 3)   points that pass the test
+    mask     : (N,)     boolean mask of kept rows
+    thresh   : float    radius threshold actually used
+    """
+    # drop NaN / ±inf first — keeps logic simple
+    finite_mask = np.isfinite(pts).all(axis=1)
+    pts         = pts[finite_mask]
+
+    dists = np.linalg.norm(pts, axis=1)   # (N,) Euclidean radii
+
+    # -------- choose threshold ----------
+    if method == "abs":
+        if abs_thresh is None:
+            raise ValueError("abs_thresh must be set for method='abs'")
+        thresh = abs_thresh
+
+    elif method == "sigma":
+        mu, sigma = dists.mean(), dists.std()
+        thresh = mu + k_sigma * sigma      # μ + kσ
+
+    elif method == "percentile":
+        thresh = np.percentile(dists, pct)
+
+    else:
+        raise ValueError(f"Unknown method '{method}'")
+
+    # -------- build mask & slice ----------
+    mask = dists <= thresh                 # keep pts inside radius
+    inliers = pts[mask]
+
+    # If you need a mask that matches the *original* array length:
+    full_mask = np.zeros(finite_mask.shape, dtype=bool)
+    full_mask[finite_mask] = mask          # re-insert into original indexing
+
+    return inliers, full_mask, thresh
+
 def shuffle_point_numpy(point_cloud):
     B, N, C = point_cloud.shape
     indices = np.random.permutation(N)
@@ -244,7 +290,10 @@ def pad_point_numpy(point_cloud, num_points):
         point_cloud = shuffle_point_numpy(point_cloud)
     return point_cloud
 
-def uniform_sampling_numpy(point_cloud, num_points):
+def uniform_sampling_numpy(point_cloud, num_points, reject_outliers: bool = True):
+    if reject_outliers:
+        point_cloud, _, _ = reject_outliers_by_radius(point_cloud.squeeze(0), method="sigma")  # Remove outliers first
+        point_cloud = point_cloud[None, ...]  # Ensure shape is (B, N, C)
     B, N, C = point_cloud.shape
     # padd if num_points > N
     if num_points > N:
@@ -255,6 +304,38 @@ def uniform_sampling_numpy(point_cloud, num_points):
     sampled_points = point_cloud[:, indices]
     return sampled_points
 
+def save_pointcloud_video(points_3d: np.ndarray,
+                          out_path: str = "pointcloud_traj.mp4",
+                          fps: int = 10,
+                          point_size: int = 5):
+    """
+    points_3d : np.ndarray  (T, N, 3)
+    out_path  : str         – output video filename
+    fps       : int         – frames per second
+    point_size: int         – size of each rendered point
+    """
+    assert points_3d.ndim == 3 and points_3d.shape[2] == 3, "Expected (T, N, 3)"
+
+    # Works even in headless notebooks 
+    plotter = pv.Plotter(off_screen=True) 
+    plotter.open_movie(out_path, framerate=fps) 
+
+    # Fix the camera once using the first frame
+    mesh = pv.PolyData(points_3d[0])
+    plotter.add_points(mesh, point_size=point_size,
+                       render_points_as_spheres=False)
+    # plotter.show(auto_close=False)          # draw 1st frame & lock camera
+    plotter.write_frame()                   # write 1st frame
+    plotter.clear()
+
+    for frame_pts in points_3d[1:]:
+        mesh.points = frame_pts
+        plotter.render()
+        plotter.iren.process_events()
+        plotter.write_frame()
+
+    plotter.close()
+    print(f"Saved → {out_path}")
 
 
 def main():

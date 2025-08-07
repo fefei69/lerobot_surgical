@@ -77,12 +77,11 @@ def load_episode_images(episode_dir: str | Path,
 device = "cuda"
 
 # Provide the [hugging face repo id](https://huggingface.co/lerobot/diffusion_pusht):
-pretrained_policy_path = "outputs/train/act_phantom_retraction/checkpoints/040000/pretrained_model"
+pretrained_policy_path = "outputs/train/act_retraction_predict_js_30hz_eff_vel_depimg_pc/checkpoints/040000/pretrained_model"
 # OR a path to a local outputs/train folder.
 # pretrained_policy_path = Path("outputs/train/example_pusht_diffusion")
-
 policy = ACTPolicy.from_pretrained(pretrained_policy_path, local_files_only=True)
-
+import pdb; pdb.set_trace()  # Debugging breakpoint
 json_dataset = JsonDataset('dataset/phantom_retraction', 'DVRK')
 
 

@@ -105,12 +105,14 @@ class ACTConfig(PreTrainedConfig):
     )
 
     # Extra Observations
-    dissection_target_feature: bool = True  # Whether to use dissection target as an observation
+    use_dissection_target_feature: bool = True  # Whether to use dissection target as an observation
+    use_point_cloud_feature: bool = True  # Whether to use point cloud as an observation
 
     # Architecture.
     # Vision backbone.
     vision_backbone: str = "resnet18" # facebook/dinov2-with-registers-base, microsoft/swinv2-tiny-patch4-window8-256
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    pretrained_pointnet_weights: str = "Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth"  # Path to the pretrained PointNet2 weights.
     replace_final_stride_with_dilation: int = False
     # The output indices of the vision backbone from AutoBackbone to use.
     vision_backbone_out_indices: tuple[int, ...] = (12,)  # (12,) for dinov2, (4,) for Swin Transformer V2

@@ -28,7 +28,8 @@ from torch import Tensor, nn
 
 from lerobot.common.utils.hub import HubMixin
 from lerobot.configs.policies import PreTrainedConfig
-
+from safetensors.torch import load_file
+import torch, logging
 T = TypeVar("T", bound="PreTrainedPolicy")
 
 DEFAULT_POLICY_CARD = """
@@ -134,22 +135,50 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         policy.eval()
         return policy
 
+    # @classmethod
+    # def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
+    #     if packaging.version.parse(safetensors.__version__) < packaging.version.parse("0.4.3"):
+    #         load_model_as_safetensor(model, model_file, strict=strict)
+    #         if map_location != "cpu":
+    #             logging.warning(
+    #                 "Loading model weights on other devices than 'cpu' is not supported natively in your version of safetensors."
+    #                 " This means that the model is loaded on 'cpu' first and then copied to the device."
+    #                 " This leads to a slower loading time."
+    #                 " Please update safetensors to version 0.4.3 or above for improved performance."
+    #             )
+    #             model.to(map_location)
+    #     else:
+    #         safetensors.torch.load_model(model, model_file, strict=strict, device=map_location)
+    #         import pdb; pdb.set_trace()  # Debugging breakpoint
+    #     return model
+    
     @classmethod
-    def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
-        if packaging.version.parse(safetensors.__version__) < packaging.version.parse("0.4.3"):
-            load_model_as_safetensor(model, model_file, strict=strict)
-            if map_location != "cpu":
-                logging.warning(
-                    "Loading model weights on other devices than 'cpu' is not supported natively in your version of safetensors."
-                    " This means that the model is loaded on 'cpu' first and then copied to the device."
-                    " This leads to a slower loading time."
-                    " Please update safetensors to version 0.4.3 or above for improved performance."
-                )
-                model.to(map_location)
-        else:
-            safetensors.torch.load_model(model, model_file, strict=strict, device=map_location)
-        return model
+    def _load_as_safetensor(
+            cls, model: T, model_file: str,
+            map_location: str = "cpu", strict: bool = True
+    ) -> T:
+        sd = load_file(model_file, device=map_location)
 
+        # broadcast the normaliser buffers to (4096,3)
+        N = 4096                                  # points per frame in your pipeline
+        for k in (
+            "normalize_inputs.buffer_observation_point_cloud.mean",
+            "normalize_inputs.buffer_observation_point_cloud.std",
+        ):
+            t = sd.get(k)
+            if t is None:
+                continue
+            if t.shape == (1, 3):                 # checkpoint after your squeeze
+                sd[k] = t.repeat(N, 1)            # → (4096,3)
+                logging.info(f"{k}: broadcasted to {sd[k].shape}")
+
+        missing, unexpected = model.load_state_dict(sd, strict=strict)
+        if missing or unexpected:
+            logging.info(f"missing={missing}, unexpected={unexpected}")
+
+        if map_location not in ("cpu", torch.device("cpu")):
+            model.to(map_location)
+        return model
     # def generate_model_card(self, *args, **kwargs) -> ModelCard:
     #     card = ModelCard.from_template(
     #         card_data=self._hub_mixin_info.model_card_data,
